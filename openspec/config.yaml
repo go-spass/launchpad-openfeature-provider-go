@@ -1,0 +1,52 @@
+schema: spec-driven
+
+# Project context (injected into every artifact instruction and into apply).
+# Only constraints an agent cannot infer by reading the code.
+context: |
+  Branch discipline: no part of a change lands on main — not the proposal,
+  specs, design or tasks, and not the implementation. Before creating or
+  editing a change, create and switch to a branch named <type>/<change-id>,
+  where <type> is the conventional-commit type (feat, fix, refactor, docs,
+  test, chore) and <change-id> is the change's directory name under
+  openspec/changes/. The whole lifecycle of a change lives on that one branch
+  and reaches main only through a merged PR. If the current branch is main,
+  stop and branch before the first write.
+
+  TDD is mandatory: every behavioral change starts with a test that fails for
+  the intended reason, then the minimum code to pass it, then refactor. No
+  implementation code is written before a failing test that demands it. In Go,
+  a build error from a missing symbol is not a useful red — add the minimal
+  declaration so the test compiles and fails on its assertion.
+
+  Verification commands for this repo:
+  go test ./... (red/green), go test -race -cover ./..., go vet ./...,
+  gofmt -l .
+
+# Per-artifact rules (constraints on what gets written, not content to copy).
+rules:
+  proposal:
+    - Name the branch the change will be developed on, in the form <type>/<change-id>.
+    - State that no work for this change will be committed to main.
+  specs:
+    - Every requirement needs at least one scenario concrete enough to become a test case before any implementation exists.
+    - Write scenarios in terms of observable behavior, so a test can assert them without reading the implementation.
+  design:
+    - Say how each new behavior will be tested and name the test package and file, so the failing test can be written first.
+    - Keep the design testable without network access or sleeps; prefer injected clocks and in-memory fixtures.
+  tasks:
+    - "First task of every change: create and switch to the branch <type>/<change-id> off an up-to-date main."
+    - Precede every behavior task with its own test task that states the expected failure.
+    - No implementation task may appear before the test task that covers it.
+    - "Last task of every change: the verification gate — gofmt -l ., go vet ./..., go test -race -cover ./..."
+
+# Per-operation advisory guidance (apply and archive only).
+operations:
+  apply:
+    guidance:
+      - Check the current branch before the first edit; if it is main, stop and create <type>/<change-id> first.
+      - Work each task red-green-refactor — write the test, run it, report the real failure output, then implement.
+      - Do not mark a task complete until go test -race ./... passes for the packages it touched.
+  archive:
+    guidance:
+      - Before archiving, confirm the full gate passes — gofmt -l ., go vet ./..., go test -race -cover ./...
+      - Archive on the change's own branch; main receives the change only through a merged PR.
