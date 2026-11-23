@@ -4,9 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project status
 
-This repository is an empty scaffold: `go.mod`, `README.md`, `LICENSE`, and `.gitignore` only.
-There is no Go source, no `go.sum`, no tests, and no `Makefile` yet. Every commit so far is
-project setup (a spec-kit scaffold was added in `254f9a5` and removed again in `bc292b8`).
+This repository is a scaffold with its tooling in place but no provider code yet. It holds
+`go.mod`, `README.md`, `LICENSE`, `.gitignore`, a `Makefile`, `.golangci.yml`, and one Go package,
+`launchpad`, whose only file is `doc.go` — a package comment and the package clause, no
+declarations. That package exists so the toolchain has something to act on: with zero packages,
+`go vet ./...` and `go test ./...` both exit non-zero, and no gate can pass. There is no `go.sum`
+(the module has no dependencies), and no tests, because there is no behavior to test.
 
 Treat the architecture notes below as the intended design, not as a description of existing code.
 Update this file as real packages land.
@@ -63,23 +66,35 @@ part of the definition of done.
 
 ## Commands
 
-No `Makefile` exists yet, so use the Go toolchain directly:
+A `Makefile` exists; prefer its targets over raw `go` commands. Bare `make` runs `check`.
 
 ```sh
-go build ./...
-go vet ./...
-go test ./...
-go test -race -cover ./...
-go test ./path/to/pkg -run TestName        # single test
-go test ./path/to/pkg -run 'TestX/subtest' # single subtest
-gofmt -l .                                 # list unformatted files
-go mod tidy
+make check   # the full gate: fmt-check, vet, lint, test — run this before calling a task done
+make build   # go build ./...
+make vet     # go vet ./...
+make test    # go test -race -cover ./...
+make lint    # golangci-lint run ./...
+make fmt     # gofmt -w: the only target that edits files
+make tidy    # go mod tidy
 ```
 
-If a `Makefile` is added, prefer its targets over raw `go` commands.
+`make lint` needs `golangci-lint` on `PATH` (`brew install golangci-lint`); it is not a module
+dependency, and the target fails with that hint rather than passing silently when the binary is
+missing. Its linter set is pinned in `.golangci.yml` (config schema `version: "2"`).
+
+`check` asserts formatting instead of applying it: `gofmt -l .` exits 0 even when it lists
+unformatted files, so the `fmt-check` target fails on non-empty output. `tidy` stays out of the
+gate because it rewrites `go.mod`.
+
+Use the toolchain directly for what has no target — single tests above all:
+
+```sh
+go test ./path/to/pkg -run TestName        # single test
+go test ./path/to/pkg -run 'TestX/subtest' # single subtest
+```
 
 ## Go version
 
-`go.mod` declares `go 1.26.5`; the installed toolchain is newer (1.27.x). Don't bump the `go`
-directive casually — it sets the minimum version consumers of this provider must have, and a
+`go.mod` declares `go 1.27.4`, which matches the installed toolchain (1.27.4). Don't bump the
+`go` directive casually — it sets the minimum version consumers of this provider must have, and a
 library should stay conservative.
