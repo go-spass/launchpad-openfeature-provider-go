@@ -4,15 +4,24 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project status
 
-This repository is a scaffold with its tooling in place but no provider code yet. It holds
-`go.mod`, `README.md`, `LICENSE`, `.gitignore`, a `Makefile`, `.golangci.yml`, and one Go package,
-`launchpad`, whose only file is `doc.go` — a package comment and the package clause, no
-declarations. That package exists so the toolchain has something to act on: with zero packages,
-`go vet ./...` and `go test ./...` both exit non-zero, and no gate can pass. There is no `go.sum`
-(the module has no dependencies), and no tests, because there is no behavior to test.
+This repository holds its tooling plus one Go package, `launchpad`, containing the provider
+skeleton: `doc.go` (package comment), `provider.go` (the provider) and `provider_test.go` (its
+tests). `Provider`, constructed by `NewProvider()`, satisfies the OpenFeature
+`FeatureProvider` interface in full and is asserted against it at compile time, so an SDK
+upgrade that changes the method set fails `go build` rather than only `make test`.
 
-Treat the architecture notes below as the intended design, not as a description of existing code.
-Update this file as real packages land.
+The provider holds no flags. Every evaluation, for all five value types, returns the default
+value the caller supplied with the `FLAG_NOT_FOUND` error code and the `ERROR` reason, built by
+one shared unexported `flagNotFound` helper. Flag storage, targeting and rollout are not
+implemented; the optional `StateHandler`, `EventHandler` and `Tracker` SDK interfaces are not
+implemented either.
+
+The module has one dependency, `github.com/open-feature/go-sdk`, pinned at `v1.20.0`, and a
+`go.sum`. That pin is a floor for consumers, since Go's minimal version selection upgrades but
+never downgrades; lowering it later is non-breaking.
+
+Treat the architecture notes below as the intended design where they describe work that has not
+landed yet. Update this file as real packages land.
 
 ## What LaunchPad is
 
