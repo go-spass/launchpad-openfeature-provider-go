@@ -1,0 +1,17 @@
+version: "2"
+
+# Pin the linter set explicitly rather than tracking whatever the installed
+# golangci-lint version considers standard, so a binary upgrade cannot change
+# what `make lint` enforces.
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+
+formatters:
+  enable:
+    - gofmt
