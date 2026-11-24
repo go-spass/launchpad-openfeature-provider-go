@@ -4,17 +4,31 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project status
 
-This repository holds its tooling plus one Go package, `launchpad`, containing the provider
-skeleton: `doc.go` (package comment), `provider.go` (the provider) and `provider_test.go` (its
-tests). `Provider`, constructed by `NewProvider()`, satisfies the OpenFeature
-`FeatureProvider` interface in full and is asserted against it at compile time, so an SDK
-upgrade that changes the method set fails `go build` rather than only `make test`.
+This repository holds its tooling plus one Go package, `launchpad`: `doc.go` (package comment),
+`flag.go` (the flag domain and its validation), `provider.go` (the provider) and their tests in
+`flagset_test.go` and `provider_test.go`. `Provider`, constructed by `NewProvider()`, satisfies
+the OpenFeature `FeatureProvider` interface in full and is asserted against it at compile time,
+so an SDK upgrade that changes the method set fails `go build` rather than only `make test`.
 
-The provider holds no flags. Every evaluation, for all five value types, returns the default
-value the caller supplied with the `FLAG_NOT_FOUND` error code and the `ERROR` reason, built by
-one shared unexported `flagNotFound` helper. Flag storage, targeting and rollout are not
-implemented; the optional `StateHandler`, `EventHandler` and `Tracker` SDK interfaces are not
-implemented either.
+Flags are supplied as a `FlagSet`, which is well-formed by construction: `NewFlagSet` is the only
+way to build a non-empty one, and it rejects a flag with no variants, variants that hold more
+than one type, or a default variant naming no variant of that flag, reporting every violation in
+flag-key order. It also normalizes numbers once — whole numbers to `int64`, fractional to
+`float64` — so an evaluation needs one type assertion rather than a search through every Go
+numeric type. The returned set copies the caller's map and each flag's variants, shallowly.
+
+`NewProvider(opts ...Option)` serves a set passed with `WithFlags`; with no options it holds an
+empty set. All five evaluation methods share one unexported `resolve` seam — lookup, then state,
+then the default variant — and then assert the requested type: an enabled flag resolves with the
+`STATIC` reason and its variant name, a disabled flag returns the caller's default with
+`DISABLED`, an unheld key reports `FLAG_NOT_FOUND` via the `flagNotFound` helper, and a wrong
+type reports `TYPE_MISMATCH`. An integral variant satisfies both numeric methods; an object
+evaluation accepts any resolved value. Nothing is mutable after construction, so there is no
+mutex.
+
+File loading, multi-source sync, targeting and rollout are not implemented; neither are the
+optional `StateHandler`, `EventHandler` and `Tracker` SDK interfaces. The next change adopts a
+declared subset of the flagd flag definition format in YAML.
 
 The module has one dependency, `github.com/open-feature/go-sdk`, pinned at `v1.20.0`, and a
 `go.sum`. That pin is a floor for consumers, since Go's minimal version selection upgrades but

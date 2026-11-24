@@ -4,6 +4,7 @@ import (
 	"context"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/go-spass/launchpad-openfeature-provider-go/launchpad"
@@ -294,6 +295,516 @@ func TestClientEvaluation_MissingFlag(t *testing.T) {
 		t.Errorf("details.ErrorCode = %q, want %q", details.ErrorCode, openfeature.FlagNotFoundCode)
 	}
 
+	if got := openfeature.NamedProviderMetadata(domain).Name; got != launchpad.ProviderName {
+		t.Errorf("provider name for domain %q = %q, want %q", domain, got, launchpad.ProviderName)
+	}
+}
+
+func TestNewProvider_AcceptsAFlagSet(t *testing.T) {
+	t.Parallel()
+
+	set, err := launchpad.NewFlagSet(map[string]launchpad.Flag{
+		"new-checkout": {
+			State:          launchpad.Enabled,
+			DefaultVariant: "on",
+			Variants:       map[string]any{"on": true, "off": false},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewFlagSet() error = %v, want nil", err)
+	}
+
+	if got := launchpad.NewProvider(launchpad.WithFlags(set)); got == nil {
+		t.Error("NewProvider(WithFlags(set)) = nil, want a provider")
+	}
+	if got := launchpad.NewProvider(); got == nil {
+		t.Error("NewProvider() = nil, want a provider")
+	}
+}
+
+func TestNewProvider_ZeroFlagSetResolvesNothing(t *testing.T) {
+	t.Parallel()
+
+	// A caller who ignores the error from NewFlagSet passes the zero value.
+	var set launchpad.FlagSet
+	provider := launchpad.NewProvider(launchpad.WithFlags(set))
+
+	got := provider.BooleanEvaluation(context.Background(), "new-checkout", true, nil)
+
+	if got.Value != true {
+		t.Errorf("BooleanEvaluation() value = %v, want the caller's default true", got.Value)
+	}
+	if code := got.ResolutionError.Error(); !strings.Contains(code, string(openfeature.FlagNotFoundCode)) {
+		t.Errorf("BooleanEvaluation() error = %q, want it to carry %v", code, openfeature.FlagNotFoundCode)
+	}
+}
+
+// enabledSet is a flag set holding one enabled flag, for tests that care about
+// a single flag's resolution rather than about validation.
+func enabledSet(t *testing.T, key string, defaultVariant string, variants map[string]any) launchpad.FlagSet {
+	t.Helper()
+
+	set, err := launchpad.NewFlagSet(map[string]launchpad.Flag{
+		key: {State: launchpad.Enabled, DefaultVariant: defaultVariant, Variants: variants},
+	})
+	if err != nil {
+		t.Fatalf("NewFlagSet() error = %v, want nil", err)
+	}
+
+	return set
+}
+
+func TestEvaluation_ResolvesEnabledFlag(t *testing.T) {
+	t.Parallel()
+
+	set := enabledSet(t, "new-checkout", "on", map[string]any{"on": true, "off": false})
+	provider := launchpad.NewProvider(launchpad.WithFlags(set))
+
+	got := provider.BooleanEvaluation(context.Background(), "new-checkout", false, nil)
+
+	if !got.Value {
+		t.Errorf("BooleanEvaluation() value = %v, want true", got.Value)
+	}
+	if got.Reason != openfeature.StaticReason {
+		t.Errorf("BooleanEvaluation() reason = %v, want %v", got.Reason, openfeature.StaticReason)
+	}
+	if got.Variant != "on" {
+		t.Errorf("BooleanEvaluation() variant = %q, want %q", got.Variant, "on")
+	}
+	if got.ResolutionError != (openfeature.ResolutionError{}) {
+		t.Errorf("BooleanEvaluation() error = %v, want no error", got.ResolutionError)
+	}
+}
+
+func TestEvaluation_ResolvesEveryValueType(t *testing.T) {
+	t.Parallel()
+
+	object := map[string]any{"theme": "dark"}
+
+	tests := map[string]struct {
+		variant string
+		value   any
+		call    func(*launchpad.Provider, string) (any, openfeature.ProviderResolutionDetail)
+	}{
+		"boolean": {variant: "on", value: true, call: func(p *launchpad.Provider, k string) (any, openfeature.ProviderResolutionDetail) {
+			got := p.BooleanEvaluation(context.Background(), k, false, nil)
+
+			return got.Value, got.ProviderResolutionDetail
+		}},
+		"string": {variant: "formal", value: "Good day", call: func(p *launchpad.Provider, k string) (any, openfeature.ProviderResolutionDetail) {
+			got := p.StringEvaluation(context.Background(), k, "fallback", nil)
+
+			return got.Value, got.ProviderResolutionDetail
+		}},
+		"int": {variant: "standard", value: int64(50), call: func(p *launchpad.Provider, k string) (any, openfeature.ProviderResolutionDetail) {
+			got := p.IntEvaluation(context.Background(), k, 10, nil)
+
+			return got.Value, got.ProviderResolutionDetail
+		}},
+		"float": {variant: "precise", value: 2.5, call: func(p *launchpad.Provider, k string) (any, openfeature.ProviderResolutionDetail) {
+			got := p.FloatEvaluation(context.Background(), k, 1.5, nil)
+
+			return got.Value, got.ProviderResolutionDetail
+		}},
+		"object": {variant: "dark", value: object, call: func(p *launchpad.Provider, k string) (any, openfeature.ProviderResolutionDetail) {
+			got := p.ObjectEvaluation(context.Background(), k, nil, nil)
+
+			return got.Value, got.ProviderResolutionDetail
+		}},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			set := enabledSet(t, "flag", tt.variant, map[string]any{tt.variant: tt.value})
+			value, detail := tt.call(launchpad.NewProvider(launchpad.WithFlags(set)), "flag")
+
+			if !reflect.DeepEqual(value, tt.value) {
+				t.Errorf("value = %#v, want %#v", value, tt.value)
+			}
+			if detail.Reason != openfeature.StaticReason {
+				t.Errorf("reason = %v, want %v", detail.Reason, openfeature.StaticReason)
+			}
+			if detail.Variant != tt.variant {
+				t.Errorf("variant = %q, want %q", detail.Variant, tt.variant)
+			}
+			if detail.ResolutionError != (openfeature.ResolutionError{}) {
+				t.Errorf("error = %v, want no error", detail.ResolutionError)
+			}
+		})
+	}
+}
+
+func TestEvaluation_DisabledFlagReturnsCallerDefault(t *testing.T) {
+	t.Parallel()
+
+	set, err := launchpad.NewFlagSet(map[string]launchpad.Flag{
+		"new-checkout": {
+			State:          launchpad.Disabled,
+			DefaultVariant: "on",
+			Variants:       map[string]any{"on": true, "off": false},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewFlagSet() error = %v, want nil", err)
+	}
+	provider := launchpad.NewProvider(launchpad.WithFlags(set))
+
+	got := provider.BooleanEvaluation(context.Background(), "new-checkout", false, nil)
+
+	if got.Value {
+		t.Errorf("BooleanEvaluation() value = %v, want the caller's default false", got.Value)
+	}
+	if got.Reason != openfeature.DisabledReason {
+		t.Errorf("BooleanEvaluation() reason = %v, want %v", got.Reason, openfeature.DisabledReason)
+	}
+	if got.ResolutionError != (openfeature.ResolutionError{}) {
+		t.Errorf("BooleanEvaluation() error = %v, want no error", got.ResolutionError)
+	}
+	if got.Variant != "" {
+		t.Errorf("BooleanEvaluation() variant = %q, want the empty string", got.Variant)
+	}
+}
+
+func TestEvaluation_DisabledIsDistinguishableFromNotFound(t *testing.T) {
+	t.Parallel()
+
+	set, err := launchpad.NewFlagSet(map[string]launchpad.Flag{
+		"new-checkout": {
+			State:          launchpad.Disabled,
+			DefaultVariant: "on",
+			Variants:       map[string]any{"on": true},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewFlagSet() error = %v, want nil", err)
+	}
+	provider := launchpad.NewProvider(launchpad.WithFlags(set))
+
+	disabled := provider.BooleanEvaluation(context.Background(), "new-checkout", true, nil)
+	absent := provider.BooleanEvaluation(context.Background(), "absent", true, nil)
+
+	if !disabled.Value || !absent.Value {
+		t.Errorf("values = %v and %v, want both to be the caller's default true", disabled.Value, absent.Value)
+	}
+	if disabled.Reason != openfeature.DisabledReason {
+		t.Errorf("disabled reason = %v, want %v", disabled.Reason, openfeature.DisabledReason)
+	}
+	if disabled.ResolutionError != (openfeature.ResolutionError{}) {
+		t.Errorf("disabled error = %v, want no error", disabled.ResolutionError)
+	}
+	if absent.Reason != openfeature.ErrorReason {
+		t.Errorf("absent reason = %v, want %v", absent.Reason, openfeature.ErrorReason)
+	}
+	if code := absent.ResolutionError.Error(); !strings.Contains(code, string(openfeature.FlagNotFoundCode)) {
+		t.Errorf("absent error = %q, want it to carry %v", code, openfeature.FlagNotFoundCode)
+	}
+}
+
+func TestEvaluation_WrongTypeReportsTypeMismatch(t *testing.T) {
+	t.Parallel()
+
+	// Each case resolves a flag whose variant holds a value of a different
+	// type than the evaluation asks for.
+	tests := map[string]struct {
+		held any
+		call func(*launchpad.Provider, string) (any, openfeature.ProviderResolutionDetail)
+		want any
+	}{
+		"string request against a boolean flag": {held: true, want: "fallback",
+			call: func(p *launchpad.Provider, k string) (any, openfeature.ProviderResolutionDetail) {
+				got := p.StringEvaluation(context.Background(), k, "fallback", nil)
+
+				return got.Value, got.ProviderResolutionDetail
+			}},
+		"boolean request against a string flag": {held: "Good day", want: false,
+			call: func(p *launchpad.Provider, k string) (any, openfeature.ProviderResolutionDetail) {
+				got := p.BooleanEvaluation(context.Background(), k, false, nil)
+
+				return got.Value, got.ProviderResolutionDetail
+			}},
+		"int request against a string flag": {held: "Good day", want: int64(10),
+			call: func(p *launchpad.Provider, k string) (any, openfeature.ProviderResolutionDetail) {
+				got := p.IntEvaluation(context.Background(), k, 10, nil)
+
+				return got.Value, got.ProviderResolutionDetail
+			}},
+		"float request against a boolean flag": {held: true, want: 1.5,
+			call: func(p *launchpad.Provider, k string) (any, openfeature.ProviderResolutionDetail) {
+				got := p.FloatEvaluation(context.Background(), k, 1.5, nil)
+
+				return got.Value, got.ProviderResolutionDetail
+			}},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			set := enabledSet(t, "new-checkout", "only", map[string]any{"only": tt.held})
+			value, detail := tt.call(launchpad.NewProvider(launchpad.WithFlags(set)), "new-checkout")
+
+			if !reflect.DeepEqual(value, tt.want) {
+				t.Errorf("value = %#v, want the caller's default %#v", value, tt.want)
+			}
+			if code := detail.ResolutionError.Error(); !strings.Contains(code, string(openfeature.TypeMismatchCode)) {
+				t.Errorf("error = %q, want it to carry %v", code, openfeature.TypeMismatchCode)
+			}
+			if detail.Reason != openfeature.ErrorReason {
+				t.Errorf("reason = %v, want %v", detail.Reason, openfeature.ErrorReason)
+			}
+			if !strings.Contains(detail.ResolutionError.Error(), "new-checkout") {
+				t.Errorf("error = %q, want it to name the flag key", detail.ResolutionError.Error())
+			}
+			if detail.Variant != "" {
+				t.Errorf("variant = %q, want the empty string", detail.Variant)
+			}
+		})
+	}
+}
+
+func TestEvaluation_ObjectAcceptsAnyResolvedValue(t *testing.T) {
+	t.Parallel()
+
+	set := enabledSet(t, "new-checkout", "on", map[string]any{"on": true})
+	provider := launchpad.NewProvider(launchpad.WithFlags(set))
+
+	got := provider.ObjectEvaluation(context.Background(), "new-checkout", nil, nil)
+
+	if got.Value != true {
+		t.Errorf("ObjectEvaluation() value = %#v, want true", got.Value)
+	}
+	if got.Reason != openfeature.StaticReason {
+		t.Errorf("ObjectEvaluation() reason = %v, want %v", got.Reason, openfeature.StaticReason)
+	}
+	if got.ResolutionError != (openfeature.ResolutionError{}) {
+		t.Errorf("ObjectEvaluation() error = %v, want no error", got.ResolutionError)
+	}
+}
+
+func TestEvaluation_NumericRule(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a whole number resolves as an integer", func(t *testing.T) {
+		t.Parallel()
+
+		set := enabledSet(t, "max-items", "standard", map[string]any{"standard": 50})
+		got := launchpad.NewProvider(launchpad.WithFlags(set)).
+			IntEvaluation(context.Background(), "max-items", 10, nil)
+
+		if got.Value != 50 {
+			t.Errorf("IntEvaluation() value = %d, want 50", got.Value)
+		}
+		if got.Reason != openfeature.StaticReason {
+			t.Errorf("IntEvaluation() reason = %v, want %v", got.Reason, openfeature.StaticReason)
+		}
+	})
+
+	t.Run("a whole number resolves as a float", func(t *testing.T) {
+		t.Parallel()
+
+		set := enabledSet(t, "max-items", "standard", map[string]any{"standard": 50})
+		got := launchpad.NewProvider(launchpad.WithFlags(set)).
+			FloatEvaluation(context.Background(), "max-items", 1.5, nil)
+
+		if got.Value != 50.0 {
+			t.Errorf("FloatEvaluation() value = %v, want 50", got.Value)
+		}
+		if got.Reason != openfeature.StaticReason {
+			t.Errorf("FloatEvaluation() reason = %v, want %v", got.Reason, openfeature.StaticReason)
+		}
+	})
+
+	t.Run("a fractional number is not an integer", func(t *testing.T) {
+		t.Parallel()
+
+		set := enabledSet(t, "sample-rate", "precise", map[string]any{"precise": 2.5})
+		got := launchpad.NewProvider(launchpad.WithFlags(set)).
+			IntEvaluation(context.Background(), "sample-rate", 1, nil)
+
+		if got.Value != 1 {
+			t.Errorf("IntEvaluation() value = %d, want the caller's default 1", got.Value)
+		}
+		if code := got.ResolutionError.Error(); !strings.Contains(code, string(openfeature.TypeMismatchCode)) {
+			t.Errorf("IntEvaluation() error = %q, want it to carry %v", code, openfeature.TypeMismatchCode)
+		}
+	})
+
+	t.Run("a fractional number resolves as a float", func(t *testing.T) {
+		t.Parallel()
+
+		set := enabledSet(t, "sample-rate", "precise", map[string]any{"precise": 2.5})
+		got := launchpad.NewProvider(launchpad.WithFlags(set)).
+			FloatEvaluation(context.Background(), "sample-rate", 1.0, nil)
+
+		if got.Value != 2.5 {
+			t.Errorf("FloatEvaluation() value = %v, want 2.5", got.Value)
+		}
+		if got.Reason != openfeature.StaticReason {
+			t.Errorf("FloatEvaluation() reason = %v, want %v", got.Reason, openfeature.StaticReason)
+		}
+	})
+}
+
+func TestEvaluation_MatchesFlagKeysExactly(t *testing.T) {
+	t.Parallel()
+
+	set := enabledSet(t, "new-checkout", "on", map[string]any{"on": true})
+	provider := launchpad.NewProvider(launchpad.WithFlags(set))
+
+	got := provider.BooleanEvaluation(context.Background(), "New-Checkout", false, nil)
+
+	if got.Value {
+		t.Errorf("BooleanEvaluation() value = %v, want the caller's default false", got.Value)
+	}
+	if code := got.ResolutionError.Error(); !strings.Contains(code, string(openfeature.FlagNotFoundCode)) {
+		t.Errorf("BooleanEvaluation() error = %q, want it to carry %v", code, openfeature.FlagNotFoundCode)
+	}
+}
+
+func TestEvaluation_IsSafeUnderConcurrentUse(t *testing.T) {
+	t.Parallel()
+
+	set := enabledSet(t, "new-checkout", "on", map[string]any{"on": true, "off": false})
+	provider := launchpad.NewProvider(launchpad.WithFlags(set))
+
+	var wg sync.WaitGroup
+	for range 64 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			got := provider.BooleanEvaluation(context.Background(), "new-checkout", false, nil)
+			if !got.Value || got.Variant != "on" {
+				t.Errorf("BooleanEvaluation() = (%v, %q), want (true, \"on\")", got.Value, got.Variant)
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+// unresolvableSet holds a disabled flag and a boolean flag, which between them
+// reach every outcome where the provider resolves no usable value for a key it
+// does hold.
+func unresolvableSet(t *testing.T) launchpad.FlagSet {
+	t.Helper()
+
+	set, err := launchpad.NewFlagSet(map[string]launchpad.Flag{
+		"disabled-flag": {
+			State:          launchpad.Disabled,
+			DefaultVariant: "on",
+			Variants:       map[string]any{"on": true},
+		},
+		"boolean-flag": {
+			State:          launchpad.Enabled,
+			DefaultVariant: "on",
+			Variants:       map[string]any{"on": true},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewFlagSet() error = %v, want nil", err)
+	}
+
+	return set
+}
+
+func TestEvaluation_DefaultPassesThroughForEveryUnresolvableOutcome(t *testing.T) {
+	t.Parallel()
+
+	provider := launchpad.NewProvider(launchpad.WithFlags(unresolvableSet(t)))
+
+	disabled := provider.BooleanEvaluation(context.Background(), "disabled-flag", false, nil)
+	if disabled.Value {
+		t.Errorf("disabled value = %v, want the caller's default false", disabled.Value)
+	}
+
+	mismatch := provider.StringEvaluation(context.Background(), "boolean-flag", "fallback", nil)
+	if mismatch.Value != "fallback" {
+		t.Errorf("mismatch value = %q, want the caller's default %q", mismatch.Value, "fallback")
+	}
+}
+
+func TestEvaluation_HeldFlagNeverReportsFlagNotFound(t *testing.T) {
+	t.Parallel()
+
+	provider := launchpad.NewProvider(launchpad.WithFlags(unresolvableSet(t)))
+
+	disabled := provider.BooleanEvaluation(context.Background(), "disabled-flag", false, nil)
+	if disabled.ResolutionError != (openfeature.ResolutionError{}) {
+		t.Errorf("disabled error = %v, want no error at all", disabled.ResolutionError)
+	}
+
+	mismatch := provider.StringEvaluation(context.Background(), "boolean-flag", "fallback", nil)
+	if code := mismatch.ResolutionError.Error(); strings.Contains(code, string(openfeature.FlagNotFoundCode)) {
+		t.Errorf("mismatch error = %q, want it not to carry %v", code, openfeature.FlagNotFoundCode)
+	}
+}
+
+func TestEvaluation_VariantIsEmptyWheneverNoVariantWasSelected(t *testing.T) {
+	t.Parallel()
+
+	provider := launchpad.NewProvider(launchpad.WithFlags(unresolvableSet(t)))
+
+	if got := provider.BooleanEvaluation(context.Background(), "disabled-flag", false, nil); got.Variant != "" {
+		t.Errorf("disabled variant = %q, want the empty string", got.Variant)
+	}
+	if got := provider.StringEvaluation(context.Background(), "boolean-flag", "fallback", nil); got.Variant != "" {
+		t.Errorf("mismatch variant = %q, want the empty string", got.Variant)
+	}
+}
+
+// Not parallel, and with its own domain: provider registration is SDK-global,
+// so sharing a domain with another test would make both order-dependent.
+func TestClientEvaluation_ResolvedFlag(t *testing.T) {
+	const domain = "launchpad-test-resolved"
+
+	t.Cleanup(openfeature.Shutdown)
+
+	set, err := launchpad.NewFlagSet(map[string]launchpad.Flag{
+		"new-checkout": {
+			State:          launchpad.Enabled,
+			DefaultVariant: "on",
+			Variants:       map[string]any{"on": true, "off": false},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewFlagSet() error = %v, want nil", err)
+	}
+
+	provider := launchpad.NewProvider(launchpad.WithFlags(set))
+	if err := openfeature.SetNamedProviderAndWait(domain, provider); err != nil {
+		t.Fatalf("SetNamedProviderAndWait: %v", err)
+	}
+
+	client := openfeature.NewClient(domain)
+	ctx := context.Background()
+
+	value, err := client.BooleanValue(ctx, "new-checkout", false, openfeature.EvaluationContext{})
+	if err != nil {
+		t.Fatalf("BooleanValue returned %v, want no error for a flag that resolves", err)
+	}
+	if !value {
+		t.Errorf("BooleanValue = %v, want true (the flag's own value, not the default)", value)
+	}
+
+	details, err := client.BooleanValueDetails(ctx, "new-checkout", false, openfeature.EvaluationContext{})
+	if err != nil {
+		t.Fatalf("BooleanValueDetails returned %v, want no error", err)
+	}
+
+	if !details.Value {
+		t.Errorf("details.Value = %v, want true", details.Value)
+	}
+	if details.Variant != "on" {
+		t.Errorf("details.Variant = %q, want %q", details.Variant, "on")
+	}
+	if details.Reason != openfeature.StaticReason {
+		t.Errorf("details.Reason = %q, want %q", details.Reason, openfeature.StaticReason)
+	}
+	if details.ErrorCode != "" {
+		t.Errorf("details.ErrorCode = %q, want no error code", details.ErrorCode)
+	}
 	if got := openfeature.NamedProviderMetadata(domain).Name; got != launchpad.ProviderName {
 		t.Errorf("provider name for domain %q = %q, want %q", domain, got, launchpad.ProviderName)
 	}
